@@ -1,13 +1,17 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
-
+#include "string.h"
 //biblioteca para comunicação SPI
 #include "hardware/spi.h"
 
 //incluir bibliotecas do chip
 #include "wizchip_conf.h"
 #include "socket.h"
-#include "w5500.h"
+//#include "w5500.h"
+#include "dhcp.h"
+
+//para dns
+//#include "dns.h"
 
 //definir pinos de comunicação SPI
 #define W5500_SPI_PORT  spi0     //selecionar caso acha mais de um dispositivo por comunicação SPI
@@ -52,6 +56,98 @@ void w5500_reset(){
     sleep_ms(100);
 };
 
+wiz_NetInfo netif;
+
+//inicialização do módulo e configuração de rede
+void w5500_initialize(bool use_dhcp) {
+
+    // Buffers para TX e RX do W5500
+    //W5500 tem 16 KB para TX e 16 KB para RX
+    uint8_t txbuf[8] = {2,2,2,2,2,2,2,2};  //
+    uint8_t rxbuf[8] = {2,2,2,2,2,2,2,2};
+
+    // Inicializa o chip W5500
+    if (wizchip_init(txbuf, rxbuf) != 0) {
+        printf("Falha ao iniciar W5500\n");
+        while (1) {} // Loop infinito em caso de falha
+    }
+
+    // Estrutura para armazenar dados de rede
+
+    //precisa inicializar o mac
+
+    if (use_dhcp) {
+        netif.dhcp = NETINFO_DHCP; //indica que será usado o dhcp
+        // Configuração dinâmica via DHCP
+        uint8_t dhcp_buffer[548];
+        DHCP_init(0, dhcp_buffer);  //socket 0
+        while (DHCP_run() != DHCP_IP_LEASED) {} // Aguarda IP
+        //dhcp_get_ip_assign(&netif);
+        getIPfromDHCP(netif.ip);
+        getGWfromDHCP(netif.gw);
+        getSNfromDHCP(netif.sn);
+        getDNSfromDHCP(netif.dns);  //endereço do servidor dns
+        printf("IP obtido via DHCP\n");
+    } else {
+
+        //configuração estática
+        uint8_t mac[6]  = {0x00, 0x08, 0xDC, 0x01, 0x02, 0x03};
+        uint8_t ip[4]   = {192, 168, 1, 123};
+        uint8_t sn[4]   = {255, 255, 255, 0};
+        uint8_t gw[4]   = {192, 168, 1, 1};
+        uint8_t dns[4]  = {8, 8, 8, 8};
+
+        memcpy(netif.mac, mac, sizeof(mac));
+        memcpy(netif.ip,  ip,  sizeof(ip));
+        memcpy(netif.sn,  sn,  sizeof(sn));
+        memcpy(netif.gw,  gw,  sizeof(gw));
+        memcpy(netif.dns, dns, sizeof(dns));
+        
+        netif.dhcp = NETINFO_STATIC;                            // Modo estático
+        wizchip_setnetinfo(&netif);                             // Aplica configuração
+    }
+
+}
+
+//para dns
+uint8_t dest_ip[4]; // Vai guardar o IP convertido
+uint8_t dns_server[4] = {8,8,8,8}; // Servidor DNS do Google  -- tem o armazenado em netif.dns
+/*
+void resolve_hostname() {
+    int8_t ret;
+
+    // Inicializa o DNS no socket 0
+    DNS_init(0, (uint8_t *)""); 
+
+    printf("Resolvendo host...\n");
+
+    // Faz a consulta de DNS
+    ret = gethostbyname((uint8_t *)"meuservidor.com", dest_ip, dns_server);
+
+    if(ret == 1) {
+        printf("IP resolvido: %d.%d.%d.%d\n", dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3]);
+    } else {
+        printf("Falha ao resolver host, erro %d\n", ret);
+    }
+}
+*/
+
+// ==== Exibe configuração de rede e status físico ====
+void print_network_info(void) {
+    //wiz_NetInfo netif;
+    wizchip_getnetinfo(&netif);
+
+    // Exibe IP, gateway e máscara
+    printf("IP: %d.%d.%d.%d\n", netif.ip[0], netif.ip[1], netif.ip[2], netif.ip[3]);
+    printf("GW: %d.%d.%d.%d\n", netif.gw[0], netif.gw[1], netif.gw[2], netif.gw[3]);
+    printf("SN: %d.%d.%d.%d\n", netif.sn[0], netif.sn[1], netif.sn[2], netif.sn[3]);
+
+    // Verifica link físico (cabo conectado)
+    uint8_t link = 0;
+    ctlwizchip(CW_GET_PHYLINK, (void*)&link);
+    printf("Link físico: %s\n", link ? "Sim" : "Não");
+}
+
 int main()
 {
     stdio_init_all();
@@ -69,12 +165,44 @@ int main()
     gpio_set_function(W5500_SPI_MOSI, GPIO_FUNC_SPI);
     gpio_init(W5500_SPI_CS);
     gpio_set_dir(W5500_SPI_CS, GPIO_OUT);   //definindo como gpio para ser possível selecionar ou não
-    wizchip_select();                        //deixa o w5500 em estado dormente
+    wizchip_deselect();                        //deixa o w5500 em estado dormente
 
     //Resetando o w5500
     gpio_init(W5500_RESET);
     gpio_set_dir(W5500_RESET, GPIO_OUT);
     w5500_reset();                          //reseta chip ao iniciar
+
+    printf("Iniciando W5500...\n");
+
+     // Inicializa W5500: false = IP estático, true = DHCP
+    w5500_initialize(false);
+
+    printf("Configuração de rede:\n");
+    print_network_info();
+
+    // ==== Exemplo simples de comunicação TCP ====
+    // Abre socket TCP na porta 5000
+    int sock = socket(0, Sn_MR_TCP, 5000, 0);
+
+    // Define IP de destino -- modelo fixo
+    uint8_t dest[4] = {192,168,1,100};
+
+    //com dns chama-se a função
+    //resolve_hostname();
+
+    // Conecta ao destino
+    connect(sock, dest, 5000);
+
+    // Envia mensagem
+    send(sock, (uint8_t*)"Olá Pico!", 9);
+
+    // Recebe resposta
+    uint8_t buf[64];
+    int len = recv(sock, buf, sizeof(buf));
+    if (len > 0) {
+        buf[len] = 0; // Termina string
+        printf("Recebido: %s\n", buf);
+    }
 
     while (true) {
         printf("Teste!\n");
